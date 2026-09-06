@@ -34,7 +34,7 @@ Thuật toán hoạt động song song ở 2 tần số khác nhau trên ESP32:
   - Bộ lọc Kalman dùng tọa độ thô này để **hiệu chỉnh (correct)** lại vị trí đang dự đoán và kéo vận tốc, gia tốc của IMU về chuẩn, triệt tiêu hoàn toàn sai số tích lũy.
 
 ### 3. Các Cơ chế Bảo vệ Thông minh (Smart Protection)
-* **Tự động chống nhiễu che khuất (Adaptive NLOS Detection):** Khi nhận tọa độ UWB mới, bộ lọc kiểm tra độ lệch (residual) so với vị trí dự đoán từ IMU. Nếu độ lệch vượt ngưỡng `0.5m` (`nlos_threshold`), hệ thống nhận diện sóng UWB đang bị phản xạ/che khuất (NLOS). Lập tức, ma trận nhiễu đo đạc UWB ($R_{uwb}$) được tự động tăng lên gấp 20 lần ($1.0$ thay vì $0.05$). Hệ thống tạm thời "không tin" UWB và lướt đi mượt mà bằng quán tính IMU.
+* **Tự động chống nhiễu che khuất (Adaptive NLOS Detection):** Khi nhận tọa độ UWB mới, bộ lọc kiểm tra độ lệch (residual) so với vị trí dự đoán từ IMU. Nếu độ lệch vượt ngưỡng `0.5m` (`nlos_threshold`), hệ thống nghi ngờ NLOS và tăng độ lệch chuẩn đo UWB từ `0.05m` lên `1.0m` (tương đương tăng covariance từ `0.0025` lên `1.0`). Hệ thống tạm thời giảm tin cậy vào UWB và lướt đi mượt mà bằng quán tính IMU.
 * **Cập nhật Vận tốc Không (ZUPT - Zero-Velocity Update):** Khi đứng yên, nhiễu trắng của gia tốc kế có thể làm hệ thống tưởng thẻ Tag đang trượt đi slowly. Nhờ hàm `imu.isStationary()`, khi phát hiện thẻ Tag đứng yên, bộ lọc lập tức ép phương trình vận tốc về $v_x = 0, v_y = 0$, khóa chặt vị trí đứng yên như bàn thạch!
 
 ---
@@ -69,7 +69,7 @@ Trên thiết bị di động (Tag), **ESP32** đóng vai trò xử lý trung t�
 Hệ thống sử dụng **3 Anchor** làm mốc tọa độ cố định trong không gian 2D. Thuật toán `trilaterate2d` trong code giải phương trình giao điểm của 3 đường tròn để tìm ra tọa độ $(x, y)$.
 
 ### Tọa độ Thiết lập trong Code
-Trong file `dinh-vi-uwb.ino`, các trạm gốc được khai báo như sau:
+Trong file `dinh-vi-uwb/dinh-vi-uwb.ino`, các trạm gốc được khai báo như sau:
 * **Base 0 (Anchor 0):** `(x: 0.0m, y: 0.7m)`
 * **Base 1 (Anchor 1):** `(x: 6.0m, y: 6.942m)`
 * **Base 2 (Anchor 2):** `(x: 6.0m, y: 0.0m)`
@@ -134,13 +134,13 @@ Module Ai-Thinker BU03 (hoặc các board tương tự dùng chip DW1000 + STM32
 ### Bước 2: Hiệu chỉnh IMU (Tĩnh)
 > [!WARNING]
 > **RẤT QUAN TRỌNG:**
-> Khi bật nguồn ESP32, trong **3 giây đầu tiên** (khi hàm `imu.calibrate(500)` đang chạy), bạn **BẮT BUỘC phải đặt thẻ Tag đứng yên hoàn toàn** trên mặt bàn phẳng. Nếu rung lắc trong giai đoạn này, gia tốc tĩnh sẽ bị tính sai bias dẫn đến hiện tượng trôi (drift) vị trí liên tục!
+> Khi bật nguồn ESP32, trong **3 giây đầu tiên** (khi hàm `imu.calibrate(300)` đang chạy), bạn **BẮT BUỘC phải đặt thẻ Tag đứng yên hoàn toàn** trên mặt bàn phẳng. Nếu rung lắc trong giai đoạn này, gia tốc tĩnh sẽ bị tính sai bias dẫn đến hiện tượng trôi (drift) vị trí liên tục!
 
 ### Bước 3: Hiệu chỉnh Sai số Khoảng cách UWB (Distance Offsets)
 Sóng UWB có thể bị sai số cố định do trễ phần cứng hoặc anten (antenna delay). Để hiệu chỉnh:
 1. Đặt Tag ở một vị trí biết trước tọa độ chính xác, hoặc đo khoảng cách thực tế bằng thước laser từ Tag đến từng Anchor 0, 1, 2.
 2. So sánh khoảng cách đo được bằng thước với khoảng cách thô xuất ra từ UWB.
-3. Nếu có sai số cố định (ví dụ UWB luôn đo dài hơn thực tế `0.15m`), điều chỉnh mảng bù sai số ở **dòng 27** trong file `dinh-vi-uwb.ino`:
+3. Nếu có sai số cố định (ví dụ UWB luôn đo dài hơn thực tế `0.15m`), điều chỉnh mảng bù sai số `distance_offsets` gần đầu file `dinh-vi-uwb/dinh-vi-uwb.ino`:
    ```cpp
    // Sai số hiệu chỉnh: [Bù Anchor 0, Bù Anchor 1, Bù Anchor 2]
    float distance_offsets[3] = {-0.15, -0.10, -0.12}; 
@@ -149,9 +149,9 @@ Sóng UWB có thể bị sai số cố định do trễ phần cứng hoặc ant
 ### Bước 4: Kiểm thử Dung hợp (Kalman Fusion Verification)
 - Mở **Serial Plotter** (hoặc dùng Python script / MATLAB / Excel) để vẽ đồ thị theo chuỗi đầu ra CSV:
   ```text
-  x_fused,y_fused
-  1.234,2.456
-  1.236,2.458
+  x_fused,y_fused,uwb_age_s
+  1.234,2.456,0.100
+  1.236,2.458,0.000
   ...
   ```
 - **Kiểm tra tính năng ZUPT (Zero-Velocity Update):** Khi đặt Tag đứng yên, nhờ cảm biến BMI270 phát hiện trạng thái tĩnh (`imu.isStationary()`), vận tốc được ép về 0 và tọa độ `(x, y)` sẽ đứng yên không bị dao động rớt điểm.

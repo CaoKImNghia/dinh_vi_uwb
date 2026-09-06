@@ -1,0 +1,22 @@
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Arduino IDE / Arduino CLI build output
+build/
+**/build/
+*.elf
+*.bin
+*.hex
+*.map
+*.ino.cpp
+
+# PlatformIO output (if it is used locally for experimentation)
+.pio/
+
+# Local logs and temporary files
+*.log
+*.tmp

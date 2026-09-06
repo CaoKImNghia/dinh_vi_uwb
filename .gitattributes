@@ -1,0 +1,8 @@
+# Keep source and CI files stable across Windows, Linux, and GitHub Actions.
+.gitattributes text eol=lf
+* text=auto
+*.ino text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

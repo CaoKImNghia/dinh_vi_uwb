@@ -1,11 +1,21 @@
 #include <Arduino.h>
 #include "imu_driver.h"
 
+// BU03 UART frame and validation limits. Keep the range comfortably above
+// the documented 6 m test area while rejecting corrupt/overflowed readings.
+constexpr size_t UWB_FRAME_LENGTH = 35;
+constexpr float MIN_UWB_DISTANCE_M = 0.10f;
+constexpr float MAX_UWB_DISTANCE_M = 30.0f;
+constexpr float MAX_TRILATERATION_RMS_RESIDUAL_M = 1.5f;
+
+// Align the IMU's forward axis to the UWB anchor coordinate system. Set this
+// only when the mounted IMU is rotated relative to the UWB X/Y axes.
+constexpr float IMU_TO_UWB_YAW_OFFSET_DEG = 0.0f;
+
 #define RXD2 16 // Nối với chân TX của STM32 trên BU03
 #define TXD2 17 // Nối với chân RX của STM32 trên BU03
 
 // Cấu hình hệ thống
-#define Y_OFFSET 0.35        // Độ lệch trục Y cần bù trừ ở đầu ra
 #define UART_TIMEOUT_MS 50   // Thời gian chờ tối đa cho 1 frame (chống kẹt buffer)
 #define IMU_UPDATE_MS 10     // Chu kỳ đọc IMU = 10ms → 100Hz
 #define IMU_SDA_PIN 21       // I2C SDA cho BMI270
@@ -16,11 +26,7 @@ struct Position {
   float x, y;
 };
 
-Position* base0 = new Position{0, 0.7};
-Position* base1 = new Position{6, 6.942};
-Position* base2 = new Position{6, 0};
-
-Position* base_stations[3] = {base0, base1, base2};
+Position base_stations[3] = {{0, 0.7}, {6, 6.942}, {6, 0}};
 
 // Sai số hiệu chỉnh (Calibration offsets)
 float distance_offsets[3] = {0.0, 0.0, 0.0};
@@ -43,10 +49,12 @@ private:
   float Q_acc;    // Process noise cho acceleration
 
   // Measurement noise
+  // R values are measurement variances (not standard deviations).
   float R_uwb_base;   // Base UWB measurement noise
   float R_uwb_nlos;   // NLOS UWB measurement noise (cao hơn)
 
   // NLOS detection threshold
+  float R_imu_acc;    // IMU acceleration measurement variance
   float nlos_threshold;
 
   // Timing
@@ -56,6 +64,49 @@ private:
   // Thống kê UWB
   unsigned long last_uwb_time;          // Thời điểm update UWB cuối cùng
   static const unsigned long UWB_TIMEOUT_MS = 3000;  // 3 giây không có UWB → cảnh báo
+
+  // Scalar Kalman measurement update. P is copied first so every element of
+  // the covariance update is calculated from the same prior matrix.
+  void updateScalarMeasurement(int stateIndex, float measurement,
+                               float measurementVariance) {
+    if (!isfinite(measurement) || !isfinite(measurementVariance) ||
+        measurementVariance <= 0.0f) {
+      return;
+    }
+
+    float innovationVariance = P[stateIndex][stateIndex] + measurementVariance;
+    if (!isfinite(innovationVariance) || innovationVariance <= 1e-8f) {
+      return;
+    }
+
+    float P_old[6][6];
+    float gain[6];
+    for (int i = 0; i < 6; i++) {
+      gain[i] = P[i][stateIndex] / innovationVariance;
+      for (int j = 0; j < 6; j++) {
+        P_old[i][j] = P[i][j];
+      }
+    }
+
+    float residual = measurement - state[stateIndex];
+    for (int i = 0; i < 6; i++) {
+      state[i] += gain[i] * residual;
+    }
+
+    float P_new[6][6];
+    for (int i = 0; i < 6; i++) {
+      for (int j = 0; j < 6; j++) {
+        P_new[i][j] = P_old[i][j] - gain[i] * P_old[stateIndex][j];
+      }
+    }
+
+    for (int i = 0; i < 6; i++) {
+      P[i][i] = P_new[i][i];
+      for (int j = i + 1; j < 6; j++) {
+        P[i][j] = P[j][i] = 0.5f * (P_new[i][j] + P_new[j][i]);
+      }
+    }
+  }
 
 public:
   FusionKalmanFilter() {
@@ -79,9 +130,12 @@ public:
     Q_vel = 0.1;
     Q_acc = 1.0;
 
-    R_uwb_base = 0.05;    // UWB rất chính xác khi LOS (0.05-0.06m theo paper)
-    R_uwb_nlos = 1.0;     // Khi nghi NLOS, giảm tin tưởng UWB ×20
     nlos_threshold = 0.5;  // > 0.5m residual → nghi NLOS
+
+    // Measurement variances (sigma squared).
+    R_uwb_base = 0.05f * 0.05f;  // LOS UWB sigma = 5 cm
+    R_uwb_nlos = 1.0f * 1.0f;    // NLOS UWB sigma = 1 m
+    R_imu_acc = 0.15f * 0.15f;   // World-frame IMU sigma (m/s^2)
 
     initialized = false;
     last_predict_time = 0;
@@ -96,12 +150,15 @@ public:
   // --------------------------------------------------------
   void predictWithIMU(float ax_imu, float ay_imu) {
     if (!initialized) return;
+    if (!isfinite(ax_imu) || !isfinite(ay_imu)) return;
 
     unsigned long now = millis();
     float dt = (now - last_predict_time) / 1000.0f;
     last_predict_time = now;
 
-    if (dt > 0.5f) dt = 0.01f;   // Clamp: quá lâu thì dùng default
+    // A stalled loop invalidates the integration interval. last_predict_time is
+    // already reset above, so skip this stale sample and resume next cycle.
+    if (dt > 0.5f) return;
     if (dt < 0.001f) return;      // Quá nhanh, bỏ qua
 
     float dt2 = dt * dt;
@@ -110,12 +167,16 @@ public:
 
     // --- State prediction ---
     // Dùng gia tốc IMU trực tiếp thay vì giả định constant velocity
-    state[0] += state[2] * dt + half_dt2 * ax_imu;  // x
-    state[1] += state[3] * dt + half_dt2 * ay_imu;  // y
-    state[2] += ax_imu * dt;                          // vx
-    state[3] += ay_imu * dt;                          // vy
-    state[4] = ax_imu;                                // ax (cập nhật từ IMU)
-    state[5] = ay_imu;                                // ay
+    // IMU acceleration is a measurement of the acceleration states, not an
+    // assignment. This keeps the state and covariance models consistent.
+    updateScalarMeasurement(4, ax_imu, R_imu_acc);
+    updateScalarMeasurement(5, ay_imu, R_imu_acc);
+
+    state[0] += state[2] * dt + half_dt2 * state[4];  // x
+    state[1] += state[3] * dt + half_dt2 * state[5];  // y
+    state[2] += state[4] * dt;                        // vx
+    state[3] += state[5] * dt;                        // vy
+    // state[4] and state[5] are updated via updateScalarMeasurement above.
 
     // --- Covariance prediction: P = F*P*F' + Q ---
     // State transition F (implicit):
@@ -140,7 +201,8 @@ public:
 
     // Propagate position uncertainty (x-block: indices 0,2,4)
     P_new[0][0] = P[0][0] + 2*dt*P[0][2] + dt2*P[2][2] + dt2*P[0][4] + dt3*P[2][4] + 0.25f*dt2*dt2*P[4][4];
-    P_new[0][2] = P[0][2] + dt*P[2][2] + half_dt2*P[2][4] + dt*P[0][4] + dt2*P[4][4]*half_dt2;
+    P_new[0][2] = P[0][2] + dt*(P[2][2] + P[0][4]) +
+                  1.5f*dt2*P[2][4] + 0.5f*dt3*P[4][4];
     P_new[2][0] = P_new[0][2];
     P_new[2][2] = P[2][2] + 2*dt*P[2][4] + dt2*P[4][4];
     P_new[0][4] = P[0][4] + dt*P[2][4] + half_dt2*P[4][4];
@@ -150,7 +212,8 @@ public:
 
     // Propagate position uncertainty (y-block: indices 1,3,5)
     P_new[1][1] = P[1][1] + 2*dt*P[1][3] + dt2*P[3][3] + dt2*P[1][5] + dt3*P[3][5] + 0.25f*dt2*dt2*P[5][5];
-    P_new[1][3] = P[1][3] + dt*P[3][3] + half_dt2*P[3][5] + dt*P[1][5] + dt2*P[5][5]*half_dt2;
+    P_new[1][3] = P[1][3] + dt*(P[3][3] + P[1][5]) +
+                  1.5f*dt2*P[3][5] + 0.5f*dt3*P[5][5];
     P_new[3][1] = P_new[1][3];
     P_new[3][3] = P[3][3] + 2*dt*P[3][5] + dt2*P[5][5];
     P_new[1][5] = P[1][5] + dt*P[3][5] + half_dt2*P[5][5];
@@ -166,10 +229,13 @@ public:
     P_new[4][4] += Q_acc * dt;
     P_new[5][5] += Q_acc * dt;
 
-    // Copy back
-    for (int i = 0; i < 6; i++)
-      for (int j = 0; j < 6; j++)
-        P[i][j] = P_new[i][j];
+    // Copy back + enforce symmetry (chống numerical drift)
+    for (int i = 0; i < 6; i++) {
+      P[i][i] = P_new[i][i];
+      for (int j = i + 1; j < 6; j++) {
+        P[i][j] = P[j][i] = 0.5f * (P_new[i][j] + P_new[j][i]);
+      }
+    }
   }
 
   // --------------------------------------------------------
@@ -179,6 +245,8 @@ public:
   //     [0 1 0 0 0 0]
   // --------------------------------------------------------
   void updateWithUWB(float meas_x, float meas_y) {
+    if (!isfinite(meas_x) || !isfinite(meas_y)) return;
+
     unsigned long now = millis();
 
     if (!initialized) {
@@ -216,7 +284,7 @@ public:
     float S11 = P[1][1] + R_val;
 
     float det = S00 * S11 - S01 * S10;
-    if (fabsf(det) < 1e-8f) return;  // Singular → skip update
+    if (!isfinite(det) || fabsf(det) < 1e-8f) return;  // Singular → skip update
 
     float inv_det = 1.0f / det;
     float S_inv00 =  S11 * inv_det;
@@ -243,9 +311,13 @@ public:
         P_new[i][j] = P[i][j] - (K[i][0] * P[0][j] + K[i][1] * P[1][j]);
       }
     }
-    for (int i = 0; i < 6; i++)
-      for (int j = 0; j < 6; j++)
-        P[i][j] = P_new[i][j];
+    // Copy back + enforce symmetry (chống numerical drift)
+    for (int i = 0; i < 6; i++) {
+      P[i][i] = P_new[i][i];
+      for (int j = i + 1; j < 6; j++) {
+        P[i][j] = P[j][i] = 0.5f * (P_new[i][j] + P_new[j][i]);
+      }
+    }
   }
 
   // --------------------------------------------------------
@@ -257,41 +329,14 @@ public:
     if (!initialized) return;
 
     // "Measure" velocity = 0 with very low noise
-    float R_zupt = 0.01f;  // Rất tin tưởng ZUPT
+    constexpr float R_ZUPT_VELOCITY = 0.01f * 0.01f;
 
-    // Update velocity x
-    float S_vx = P[2][2] + R_zupt;
-    if (S_vx > 1e-8f) {
-      float K_vx = P[2][2] / S_vx;
-      float residual_vx = 0.0f - state[2];
-      // Update all states correlated with vx
-      for (int i = 0; i < 6; i++) {
-        float Ki = P[i][2] / S_vx;
-        state[i] += Ki * residual_vx;
-      }
-      // Update P
-      for (int i = 0; i < 6; i++)
-        for (int j = 0; j < 6; j++)
-          P[i][j] -= (P[i][2] * P[2][j]) / S_vx;
-    }
+    updateScalarMeasurement(2, 0.0f, R_ZUPT_VELOCITY);
+    updateScalarMeasurement(3, 0.0f, R_ZUPT_VELOCITY);
 
-    // Update velocity y
-    float S_vy = P[3][3] + R_zupt;
-    if (S_vy > 1e-8f) {
-      float K_vy = P[3][3] / S_vy;
-      float residual_vy = 0.0f - state[3];
-      for (int i = 0; i < 6; i++) {
-        float Ki = P[i][3] / S_vy;
-        state[i] += Ki * residual_vy;
-      }
-      for (int i = 0; i < 6; i++)
-        for (int j = 0; j < 6; j++)
-          P[i][j] -= (P[i][3] * P[3][j]) / S_vy;
-    }
-
-    // Reset acceleration state to 0
-    state[4] = 0;
-    state[5] = 0;
+    // Stationary acceleration measurements suppress residual drift.
+    updateScalarMeasurement(4, 0.0f, 0.05f * 0.05f);
+    updateScalarMeasurement(5, 0.0f, 0.05f * 0.05f);
   }
 
   // Getters
@@ -330,18 +375,20 @@ unsigned long lastIMUReadTime = 0;
 // ============================================================
 // Hàm giải mã dữ liệu UART từ BU03 (giữ nguyên)
 // ============================================================
-bool parseUwbData(uint8_t* data, int dataLen, float* distances) {
-  if (dataLen < 35) return false;
+bool parseUwbData(const uint8_t* data, size_t dataLen, float* distances) {
+  if (dataLen != UWB_FRAME_LENGTH) return false;
   if (data[0] != 0xaa || data[1] != 0x25 || data[2] != 0x01) return false;
 
   for (int i = 0; i < 3; i++) {
     int offset = 3 + (i * 4);
-    if (offset + 1 < dataLen) {
-      uint16_t dist_raw = data[offset] | (data[offset + 1] << 8);
-      distances[i] = (dist_raw / 1000.0) + distance_offsets[i];
-    } else {
-      distances[i] = 0;
+    uint16_t dist_raw = data[offset] | (static_cast<uint16_t>(data[offset + 1]) << 8);
+    float distance = (dist_raw / 1000.0f) + distance_offsets[i];
+
+    if (!isfinite(distance) || distance < MIN_UWB_DISTANCE_M ||
+        distance > MAX_UWB_DISTANCE_M) {
+      return false;
     }
+    distances[i] = distance;
   }
   return true;
 }
@@ -355,8 +402,9 @@ bool trilaterate2d(float* distances, float* x, float* y) {
   int valid_count = 0;
 
   for (int i = 0; i < 3; i++) {
-    if (base_stations[i] != NULL && distances[i] > 0.1) {
-      valid_data[valid_count] = {base_stations[i]->x, base_stations[i]->y, distances[i]};
+    if (isfinite(distances[i]) && distances[i] >= MIN_UWB_DISTANCE_M &&
+        distances[i] <= MAX_UWB_DISTANCE_M) {
+      valid_data[valid_count] = {base_stations[i].x, base_stations[i].y, distances[i]};
       valid_count++;
     }
   }
@@ -373,14 +421,29 @@ bool trilaterate2d(float* distances, float* x, float* y) {
 
     A[i][0] = 2 * (xi - x1);
     A[i][1] = 2 * (yi - y1);
-    b[i] = pow(ri, 2) - pow(r1, 2) - pow(xi, 2) + pow(x1, 2) - pow(yi, 2) + pow(y1, 2);
+    b[i] = (ri * ri) - (r1 * r1) - (xi * xi) + (x1 * x1) - (yi * yi) + (y1 * y1);
   }
 
   float det = A[0][0] * A[1][1] - A[0][1] * A[1][0];
-  if (abs(det) < 1e-6) return false;
+  if (fabsf(det) < 1e-6f) return false;
 
   *x = -(b[0] * A[1][1] - b[1] * A[0][1]) / det;
   *y = -(A[0][0] * b[1] - A[1][0] * b[0]) / det;
+
+  // A corrupted frame can still produce a mathematical intersection. Reject
+  // solutions that do not fit the three measured circles well enough.
+  float residualSqSum = 0.0f;
+  for (int i = 0; i < valid_count; i++) {
+    float dx = *x - valid_data[i].x;
+    float dy = *y - valid_data[i].y;
+    float rangeResidual = sqrtf(dx * dx + dy * dy) - valid_data[i].dist;
+    residualSqSum += rangeResidual * rangeResidual;
+  }
+  float rmsResidual = sqrtf(residualSqSum / valid_count);
+  if (!isfinite(rmsResidual) ||
+      rmsResidual > MAX_TRILATERATION_RMS_RESIDUAL_M) {
+    return false;
+  }
 
   return true;
 }
@@ -402,11 +465,13 @@ void setup() {
     Serial.println("[WARN] IMU init failed! Running UWB-only mode.");
   } else {
     // Calibrate: giữ tag đứng yên ~3 giây
-    imu.calibrate(500);
+    if (!imu.calibrate(300)) {
+      Serial.println("[WARN] IMU calibration failed! Running UWB-only mode.");
+    }
   }
 
   // Header cho Serial Plotter/CSV
-  Serial.println("x_fused,y_fused");
+  Serial.println("x_fused,y_fused,uwb_age_s");
 
   lastIMUReadTime = millis();
 }
@@ -418,8 +483,8 @@ void setup() {
 // ============================================================
 void loop() {
   // --- UWB UART variables ---
-  static uint8_t buffer[256];
-  static int bufferIndex = 0;
+  static uint8_t buffer[UWB_FRAME_LENGTH];
+  static size_t bufferIndex = 0;
   static bool messageStarted = false;
   static unsigned long lastByteTime = 0;
 
@@ -432,19 +497,24 @@ void loop() {
     float dt_imu = (currentTime - lastIMUReadTime) / 1000.0f;
     lastIMUReadTime = currentTime;
 
-    if (imu.isReady()) {
-      float ax_world, ay_world;
-      imu.getWorldAccel(&ax_world, &ay_world, dt_imu);
+    float ax_world, ay_world;
+    if (imu.getWorldAccel(&ax_world, &ay_world, dt_imu)) {
+      constexpr float DEGREES_TO_RADIANS = 0.01745329251994329577f;
+      const float yawOffsetRad = IMU_TO_UWB_YAW_OFFSET_DEG * DEGREES_TO_RADIANS;
+      const float cosYaw = cosf(yawOffsetRad);
+      const float sinYaw = sinf(yawOffsetRad);
+      float ax_uwb = cosYaw * ax_world - sinYaw * ay_world;
+      float ay_uwb = sinYaw * ax_world + cosYaw * ay_world;
 
       // ZUPT: nếu đứng yên → ép vận tốc = 0, chống drift
       if (imu.isStationary()) {
-        ax_world = 0;
-        ay_world = 0;
+        ax_uwb = 0;
+        ay_uwb = 0;
         fusionKalman.applyZUPT();
       }
 
       // Predict: đẩy vị trí dựa trên gia tốc IMU
-      fusionKalman.predictWithIMU(ax_world, ay_world);
+      fusionKalman.predictWithIMU(ax_uwb, ay_uwb);
     }
   }
 
@@ -462,6 +532,15 @@ void loop() {
     }
     lastByteTime = currentTime;
 
+    // Reject a malformed header as soon as it is detected. If this byte is a
+    // new start marker, the normal code below immediately starts a new frame.
+    if (messageStarted &&
+        ((bufferIndex == 1 && incomingByte != 0x25) ||
+         (bufferIndex == 2 && incomingByte != 0x01))) {
+      messageStarted = false;
+      bufferIndex = 0;
+    }
+
     if (!messageStarted && incomingByte == 0xAA) {
       messageStarted = true;
       bufferIndex = 0;
@@ -470,7 +549,7 @@ void loop() {
     else if (messageStarted) {
       buffer[bufferIndex++] = incomingByte;
 
-      if (bufferIndex >= 35) {
+      if (bufferIndex >= UWB_FRAME_LENGTH) {
         float distances[3];
         if (parseUwbData(buffer, bufferIndex, distances)) {
           float x_raw, y_raw;
@@ -487,7 +566,7 @@ void loop() {
       }
 
       // Buffer overflow protection
-      if (bufferIndex >= 256) {
+      if (bufferIndex >= UWB_FRAME_LENGTH) {
         messageStarted = false;
         bufferIndex = 0;
       }
@@ -500,8 +579,9 @@ void loop() {
   if (fusionKalman.isInitialized()) {
     static unsigned long lastPrintTime = 0;
     // In ra 20Hz (mỗi 50ms) để không spam Serial quá nhanh
-    if (currentTime - lastPrintTime >= 50) {
-      lastPrintTime = currentTime;
+    unsigned long outputTime = millis();
+    if (outputTime - lastPrintTime >= 50) {
+      lastPrintTime = outputTime;
 
       float x_fused, y_fused;
       fusionKalman.getPosition(&x_fused, &y_fused);
@@ -509,17 +589,14 @@ void loop() {
       Serial.print(x_fused, 3);
       Serial.print(",");
       Serial.print(y_fused, 3);
+      Serial.print(",");
+      Serial.print(fusionKalman.getTimeSinceLastUwb() / 1000.0f, 3);
 
-      // Cảnh báo nếu mất UWB quá lâu
-      if (fusionKalman.isUwbTimedOut()) {
-        Serial.print(",IMU_ONLY(");
-        Serial.print(fusionKalman.getTimeSinceLastUwb() / 1000.0f, 1);
-        Serial.print("s)");
-      }
+      // uwb_age_s is retained as numeric data for Serial Plotter and CSV tools.
 
       Serial.println();
     }
   }
 
-  delay(1);  // Yield nhỏ để không chiếm hết CPU
+  yield();  // Nhường CPU cho FreeRTOS tasks khác
 }
